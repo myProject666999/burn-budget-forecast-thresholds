@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/tanrikuluozlem/burn/internal/advisor"
 	"github.com/tanrikuluozlem/burn/internal/analyzer"
+	"github.com/tanrikuluozlem/burn/internal/budget"
 	"github.com/tanrikuluozlem/burn/internal/collector"
 	ofmt "github.com/tanrikuluozlem/burn/internal/output"
 	"github.com/tanrikuluozlem/burn/internal/pricing"
@@ -41,6 +42,15 @@ var (
 	gpuPrice      float64
 	storagePrice  float64
 	showSpot      bool
+
+	snapshotPath      string
+	budgetConfig      string
+	budgetNoSave      bool
+	budgetGapMin      int
+	budgetTrendDays   int
+	budgetWindowDays  int
+	budgetMinSamples  int
+	budgetMinCoverage float64
 )
 
 var analyzeCmd = &cobra.Command{
@@ -66,6 +76,14 @@ func init() {
 	f.Float64Var(&gpuPrice, "gpu-price", 0, "custom GPU price per unit per hour (on-prem)")
 	f.Float64Var(&storagePrice, "storage-price", 0, "custom storage price per GiB per month (on-prem)")
 	f.BoolVar(&showSpot, "spot", false, "show spot instance readiness details")
+	f.StringVar(&snapshotPath, "snapshot-path", "", "local snapshot file for month-to-date accrual and forecasting (optional)")
+	f.StringVar(&budgetConfig, "budget", "", "path to a JSON budgets file (optional)")
+	f.BoolVar(&budgetNoSave, "budget-no-save", false, "evaluate budgets without appending a snapshot")
+	f.IntVar(&budgetGapMin, "budget-gap-threshold", 30, "minutes without a snapshot before an interval counts as a gap")
+	f.IntVar(&budgetTrendDays, "budget-trend-days", 7, "days of daily means used for the linear trend")
+	f.IntVar(&budgetWindowDays, "budget-window-days", 7, "window length for adjacent-window trend comparison")
+	f.IntVar(&budgetMinSamples, "budget-min-samples", 3, "minimum daily samples before a trend is used")
+	f.Float64Var(&budgetMinCoverage, "budget-min-coverage", 0.9, "minimum month coverage before budget conclusions are trusted (0-1)")
 
 	rootCmd.AddCommand(analyzeCmd)
 }
@@ -136,31 +154,39 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 	}
 	report.Period = coll.Period()
 
-	switch output {
-	case "json":
-		return outputJSON(report)
-	default:
-		// When --ai + --namespace: show namespace pods, AI gets full cluster
-		if withAI && namespace != "" {
-			var nsPods []analyzer.PodEfficiency
-			for _, p := range report.AllPods {
-				if p.Namespace == namespace {
-					nsPods = append(nsPods, p)
-				}
+	var budgetResult *budget.Result
+	if snapshotPath == "" && budgetConfig == "" {
+		// Legacy path: no snapshot, no budget evaluation, no files created.
+		if output == "json" {
+			return outputJSON(report)
+		}
+		outputReport(report)
+	} else {
+		budgets, err := budget.LoadBudgets(budgetConfig)
+		if err != nil {
+			return err
+		}
+		budgetResult, err = runBudgetEvaluation(report, snapshotPath, budgets, budgetTuning{
+			GapMinutes:  budgetGapMin,
+			TrendDays:   budgetTrendDays,
+			WindowDays:  budgetWindowDays,
+			MinSamples:  budgetMinSamples,
+			MinCoverage: budgetMinCoverage,
+		}, budgetNoSave, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+
+		if output == "json" {
+			if err := outputJSON(report); err != nil {
+				return err
 			}
-			if len(nsPods) > 0 {
-				var nsPVCs []analyzer.PVCost
-				var nsPVCost float64
-				for _, pv := range report.PVCosts {
-					if pv.Namespace == namespace {
-						nsPVCs = append(nsPVCs, pv)
-						nsPVCost += pv.MonthlyCost
-					}
-				}
-				outputNamespacePods(nsPods, report.MetricsSource == "prometheus", nsPVCs, nsPVCost)
-			}
-		} else {
-			outputTable(report)
+			return outputBudgetJSON(budgetResult)
+		}
+		outputReport(report)
+		if budgetResult != nil {
+			fmt.Println()
+			fmt.Print(budget.FormatText(budgetResult))
 		}
 	}
 
@@ -215,8 +241,14 @@ func runAnalyze(cmd *cobra.Command, _ []string) error {
 		}
 
 		sc := slack.NewWebhookClient(webhook)
-		if err := sc.Send(ctx, slack.FormatCostReport(report, aiReport != nil)); err != nil {
+		if err := sc.Send(ctx, slack.FormatCostReportWithBudget(report, budgetResult, aiReport != nil)); err != nil {
 			return fmt.Errorf("failed to send cost report to Slack: %w", err)
+		}
+		// A dedicated budget alert only when the persisted level increased.
+		if alert := slack.FormatBudgetAlert(budgetResult); alert != nil {
+			if err := sc.Send(ctx, alert); err != nil {
+				return fmt.Errorf("failed to send budget alert to Slack: %w", err)
+			}
 		}
 		// Send AI report only if we have one
 		if aiReport != nil {
@@ -234,6 +266,43 @@ func outputJSON(report *analyzer.CostReport) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(report)
+}
+
+// outputBudgetJSON emits the budget result as a separate top-level JSON object
+// so consumers can distinguish it from the cost report.
+func outputBudgetJSON(result *budget.Result) error {
+	if result == nil {
+		return nil
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(result)
+}
+
+// outputReport renders the human-readable report. With --ai and a namespace it
+// shows that namespace's pods; otherwise it prints the cluster-wide table.
+func outputReport(report *analyzer.CostReport) {
+	if withAI && namespace != "" {
+		var nsPods []analyzer.PodEfficiency
+		for _, p := range report.AllPods {
+			if p.Namespace == namespace {
+				nsPods = append(nsPods, p)
+			}
+		}
+		if len(nsPods) > 0 {
+			var nsPVCs []analyzer.PVCost
+			var nsPVCost float64
+			for _, pv := range report.PVCosts {
+				if pv.Namespace == namespace {
+					nsPVCs = append(nsPVCs, pv)
+					nsPVCost += pv.MonthlyCost
+				}
+			}
+			outputNamespacePods(nsPods, report.MetricsSource == "prometheus", nsPVCs, nsPVCost)
+			return
+		}
+	}
+	outputTable(report)
 }
 
 func outputTable(report *analyzer.CostReport) {

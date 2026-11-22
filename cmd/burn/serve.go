@@ -10,16 +10,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tanrikuluozlem/burn/internal/server"
 	"github.com/spf13/cobra"
+	"github.com/tanrikuluozlem/burn/internal/server"
 )
 
 var (
-	servePort        int
-	serveKubeconfig  string
-	serveKubecontext string
-	servePrometheus  string
-	servePeriod      string
+	servePort         int
+	serveKubeconfig   string
+	serveKubecontext  string
+	servePrometheus   string
+	servePeriod       string
+	serveSnapshot     string
+	serveBudgetFile   string
+	serveBudgetGap    int
+	serveBudgetWindow int
+	serveBudgetTrend  int
 )
 
 var serveCmd = &cobra.Command{
@@ -47,6 +52,11 @@ func init() {
 	f.StringVar(&serveKubecontext, "context", "", "kubeconfig context to use")
 	f.StringVar(&servePrometheus, "prometheus", "", "Prometheus server URL")
 	f.StringVar(&servePeriod, "period", "", "analysis period (e.g. 1h, 7d, 30d)")
+	f.StringVar(&serveSnapshot, "snapshot-path", "", "local snapshot file for /burn budget (or BURN_SNAPSHOT_PATH)")
+	f.StringVar(&serveBudgetFile, "budget", "", "path to a JSON budgets file for /burn budget (or BURN_BUDGET_FILE)")
+	f.IntVar(&serveBudgetGap, "budget-gap-threshold", 30, "minutes without a snapshot before an interval counts as a gap")
+	f.IntVar(&serveBudgetWindow, "budget-window-days", 7, "window length for adjacent-window trend comparison")
+	f.IntVar(&serveBudgetTrend, "budget-trend-days", 7, "days of daily means used for the linear trend")
 
 	rootCmd.AddCommand(serveCmd)
 }
@@ -69,6 +79,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if p := os.Getenv("PROMETHEUS_URL"); p != "" && servePrometheus == "" {
 		servePrometheus = p
 	}
+	if v := os.Getenv("BURN_SNAPSHOT_PATH"); v != "" && serveSnapshot == "" {
+		serveSnapshot = v
+	}
+	if v := os.Getenv("BURN_BUDGET_FILE"); v != "" && serveBudgetFile == "" {
+		serveBudgetFile = v
+	}
 
 	srv, err := server.New(server.Config{
 		Port:          servePort,
@@ -78,6 +94,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Period:        servePeriod,
 		APIKey:        apiKey,
 		SigningSecret: signingSecret,
+		SnapshotPath:  serveSnapshot,
+		BudgetFile:    serveBudgetFile,
+		GapThreshold:  time.Duration(serveBudgetGap) * time.Minute,
+		WindowDays:    serveBudgetWindow,
+		TrendDays:     serveBudgetTrend,
 	})
 	if err != nil {
 		return err

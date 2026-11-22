@@ -32,6 +32,17 @@ type Config struct {
 	Period        string
 	APIKey        string
 	SigningSecret string
+
+	// Budget snapshot and budget configuration. Both empty disables the budget
+	// feature; the /burn budget command then explains how to enable it.
+	SnapshotPath string
+	BudgetFile   string
+	// GapThreshold is how long without a snapshot before an interval counts as
+	// a gap. Zero uses the package default (30m). Set it above the snapshot
+	// cadence (e.g. 2h for hourly runs) or every interval looks like a gap.
+	GapThreshold time.Duration
+	WindowDays   int
+	TrendDays    int
 }
 
 type Server struct {
@@ -208,10 +219,12 @@ func (s *Server) processSlackCommand(text, responseURL string) {
 		response, err = s.handleNamespace(ctx, ns)
 	case text == "reconcile" || strings.HasPrefix(text, "reconcile "):
 		response, err = s.handleReconcile(ctx, text)
+	case text == "budget" || strings.HasPrefix(text, "budget "):
+		response, err = s.handleBudget(ctx)
 	case text == "" || text == "analyze":
 		response, err = s.handleAnalyze(ctx)
 	default:
-		response = fmt.Sprintf("Unknown command: %s\n\nUsage:\n  /burn — cost summary\n  /burn ns <name> — pod details\n  /burn ask \"question\" — AI analysis\n  /burn reconcile — AWS CUR reconciliation\n  /burn reconcile --provider azure\n  /burn reconcile --days 7 --data-delay 24 --cost-type amortized", text)
+		response = fmt.Sprintf("Unknown command: %s\n\nUsage:\n  /burn — cost summary\n  /burn ns <name> — pod details\n  /burn budget — month-to-date, forecast, trend, budget status\n  /burn ask \"question\" — AI analysis\n  /burn reconcile — AWS CUR reconciliation\n  /burn reconcile --provider azure\n  /burn reconcile --days 7 --data-delay 24 --cost-type amortized", text)
 	}
 
 	if err != nil {

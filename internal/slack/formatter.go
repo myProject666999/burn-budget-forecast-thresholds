@@ -7,12 +7,19 @@ import (
 
 	"github.com/tanrikuluozlem/burn/internal/advisor"
 	"github.com/tanrikuluozlem/burn/internal/analyzer"
+	"github.com/tanrikuluozlem/burn/internal/budget"
 	"github.com/tanrikuluozlem/burn/internal/output"
 )
 
 const maxBlockText = 2900
 
 func FormatCostReport(report *analyzer.CostReport, suppressLegacySavings bool) *Message {
+	return FormatCostReportWithBudget(report, nil, suppressLegacySavings)
+}
+
+// FormatCostReportWithBudget appends a budget/forecast block when budget is
+// non-nil. It is a no-op difference from FormatCostReport when budget is nil.
+func FormatCostReportWithBudget(report *analyzer.CostReport, budget *budget.Result, suppressLegacySavings bool) *Message {
 	idlePercent := 0.0
 	if report.MonthlyCost > 0 {
 		idlePercent = (report.TotalIdleCost / report.MonthlyCost) * 100
@@ -156,6 +163,10 @@ func FormatCostReport(report *analyzer.CostReport, suppressLegacySavings bool) *
 				Text: fmt.Sprintf("*Potential savings:* $%.2f/mo", report.WasteAnalysis.PotentialSavings),
 			},
 		})
+	}
+
+	if budget != nil {
+		blocks = append(blocks, formatBudgetBlocks(budget)...)
 	}
 
 	return &Message{Blocks: blocks}

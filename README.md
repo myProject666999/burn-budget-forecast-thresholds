@@ -142,6 +142,61 @@ Shows why your estimated and actual costs differ, with commands to investigate e
 burn reconcile --provider aws -o json | jq .total_actual_cost
 ```
 
+## Budgets and calendar-month forecasting
+
+`MonthlyCost` elsewhere in burn is the **current hourly rate × 730** — a
+run-rate, not a calendar-month total and not month-to-date spend. Budgets and
+forecasting add the missing pieces, from snapshots burn records locally:
+
+```bash
+# Each scheduled run appends the current hourly cost, so successive runs accrue
+burn analyze --prometheus http://prometheus:9090 \
+  --snapshot-path /var/lib/burn/snapshots.json \
+  --budget budgets.json \
+  --budget-gap-threshold 120   # hourly runs: gaps are >2h, not a missing hour
+
+# Evaluate without writing a snapshot (e.g. ad-hoc check)
+burn analyze --snapshot-path /var/lib/burn/snapshots.json --budget budgets.json --budget-no-save
+```
+
+`budgets.json`:
+
+```json
+[
+  {"name": "cluster", "amount": 4000, "thresholds": [0.8, 1.0]},
+  {"name": "app", "namespace": "app-backend", "amount": 1200, "thresholds": [0.9]}
+]
+```
+
+What the output adds:
+
+- **Month-to-date accrual** — snapshots are point observations of hourly cost,
+  integrated piecewise-constant between adjacent records. Intervals longer than
+  the gap threshold (default 30m) are reported as gaps and reduce coverage
+  instead of being counted as spend. A first run mid-month leaves the earlier
+  month **unknown, not zero**, and says so.
+- **Calendar-month forecast** — known month-to-date plus the remaining calendar
+  hours at the forecast rate. Month length is the real UTC month (28–31 days,
+  29 in a leap February); 730 is not used. The rate is the current hourly cost or
+  a linear trend over recent daily means (clamped at zero; falls back to the
+  current rate with an explanation when there are too few samples).
+- **Trend** — the trailing window vs the immediately preceding equal window,
+  with change amount and percent. A zero previous window is reported as
+  **not comparable**; differing coverage is flagged, never backfilled; new
+  namespaces are marked.
+- **Budget status** — states in priority order: `overspent` (actual),
+  `forecast_overspent`, `near_budget`, `normal`, and `insufficient_data`. A
+  threshold `T` is reached at `>= T`. Low coverage never publishes a confident
+  "under budget": such results are marked insufficient with a credible range.
+
+Snapshots are a single local JSON file (no external storage). Writes are locked
+and atomic, concurrent writers do not lose records, and a corrupt or truncated
+file is left in place with an error rather than silently rebuilt.
+
+Notifications (via Slack) fire on a level increase, do not repeat at the same
+level, and fire again after a decrease and re-increase. The stored level resets
+each UTC month.
+
 ## Spot readiness
 
 ![spot readiness](assets/demo-spot.gif)
@@ -176,6 +231,7 @@ burn serve --port 8080 --prometheus http://prometheus:9090 --period 7d
 |---------|-------------|
 | `/burn` | Full cost report: nodes, namespaces, idle cost, LB, storage |
 | `/burn ns argocd` | Pod-level breakdown for a namespace |
+| `/burn budget` | Month-to-date, calendar-month forecast, trend, and budget status |
 | `/burn reconcile --provider aws` | Estimated vs actual billing, SP/RI/Spot detection |
 | `/burn reconcile --provider azure` | Estimated vs actual billing, SP/RI/Spot detection |
 | `/burn ask "what is the single biggest waste?"` | AI analysis with investigation commands |
@@ -356,6 +412,8 @@ spec:
 | `CUR_WORKGROUP` | Athena workgroup (default: primary) | `reconcile` (AWS) |
 | `CUR_REGION` | AWS region for Athena | `reconcile` (AWS) |
 | `AZURE_SUBSCRIPTION_ID` | Azure subscription ID | `reconcile` (Azure) |
+| `BURN_SNAPSHOT_PATH` | Local snapshot file | `serve` (`/burn budget`) |
+| `BURN_BUDGET_FILE` | JSON budgets file | `serve` (`/burn budget`) |
 
 | Flag | Description |
 |------|-------------|
@@ -368,6 +426,14 @@ spec:
 | `--days` | Number of days to reconcile (default: 7) |
 | `--cost-type` | Azure cost type: `amortized` or `actual` (default: amortized) |
 | `--data-delay` | Billing data delay in hours (default: 48; AWS CUR ~24h, Azure EA/MCA 8-24h, Azure PAYG up to 72h) |
+| `--snapshot-path` | Local snapshot file for month-to-date accrual/forecast |
+| `--budget` | Path to a JSON budgets file |
+| `--budget-no-save` | Evaluate budgets without appending a snapshot |
+| `--budget-gap-threshold` | Minutes without a snapshot before an interval counts as a gap (default: 30; set above your snapshot cadence, e.g. 120 for hourly runs) |
+| `--budget-window-days` | Window length for adjacent-window trend comparison (default: 7) |
+| `--budget-trend-days` | Days of daily means used for the linear trend (default: 7) |
+| `--budget-min-samples` | Minimum daily samples before a trend is used (default: 3) |
+| `--budget-min-coverage` | Minimum month coverage before budget conclusions are trusted (default: 0.9) |
 
 AWS and Azure clusters use live cloud pricing automatically. GCP clusters use embedded pricing. On-prem pricing flags are for clusters where cloud pricing is not available.
 
