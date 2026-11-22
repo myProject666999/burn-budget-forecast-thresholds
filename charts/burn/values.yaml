@@ -1,0 +1,35 @@
+image:
+  repository: ghcr.io/tanrikuluozlem/burn
+  tag: v0.5.5
+  pullPolicy: IfNotPresent
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+schedule: "0 9 * * *"
+
+report:
+  includeAI: true
+  period: "7d"
+
+prometheus:
+  url: "http://prometheus-kube-prometheus-prometheus.monitoring:9090"
+
+secrets:
+  existingSecret: "burn-secrets"
+  slackWebhookKey: "slack-webhook-url"
+  anthropicApiKey: "anthropic-api-key"
+
